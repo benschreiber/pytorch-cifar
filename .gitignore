@@ -3,3 +3,4 @@ data
 checkpoint*/
 .idea/
 .vscode/
+*.html

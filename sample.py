@@ -2,9 +2,10 @@
 import copy
 import os
 from collections import defaultdict
-from pprint import pprint
+from functools import partial
 from typing import Callable, Dict, Iterable, Optional, Tuple
 
+import numpy as np
 import torch.backends.cudnn as cudnn
 import torchvision
 import torchvision.transforms as transforms
@@ -40,13 +41,12 @@ def prelude():
     criterion = nn.CrossEntropyLoss()
 
     print('==> Loading checkpoint..')
-    assert os.path.isdir(
-        'checkpoint_saved'), 'Error: no checkpoint directory found!'
+    assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
     if device == 'cpu':
         # Trained on GPU with DataParallel, so some changes needed to load on CPU
         pyt_device = torch.device('cpu')
         checkpoint = torch.load(
-            './checkpoint_saved/ckpt.pth', map_location=pyt_device)
+            './checkpoint/ckpt.pth', map_location=pyt_device)
         from collections import OrderedDict
         new_state_dict = OrderedDict()
         for k, v in checkpoint['net'].items():
@@ -54,7 +54,7 @@ def prelude():
             new_state_dict[name] = v
         net.load_state_dict(new_state_dict)
     else:
-        checkpoint = torch.load('./checkpoint_saved/ckpt.pth')
+        checkpoint = torch.load('./checkpoint/ckpt.pth')
         net.load_state_dict(checkpoint['net'])
 
     return net, testloader, classes, criterion
@@ -132,7 +132,7 @@ def prune_weight(ratio: float, layer: nn.Conv2d):
 def get_approxer(net_type: type):
     from functools import partial
     if net_type == nn.Conv2d:
-        return [partial(prune_weight, f) for f in (0.25, 0.5, 0.7)]
+        return [partial(prune_weight, f) for f in (0.25,)]  # 0.5, 0.7)]
     else:
         return []
 
@@ -141,9 +141,60 @@ class SensitivityAnalysis:
     approximator_ct = Callable[[nn.Module], str]
     approx_key_t = Tuple[int, str]
 
-    def __init__(self):
+    def __init__(self, norm):
         self.baseline_state = {}
-        self.approx_state = defaultdict(dict)
+        self.approx_state = defaultdict(lambda: defaultdict(dict))
+        self.norm_func = norm
+
+    def set_approx_state(self, approx_state: Dict[float, float], output, this_idx: int):
+        baseline, base_norm, n_elem = self.baseline_state[this_idx]
+        diff_norm_tensor = self.norm_func(output - baseline)  # / base_norm / n_elem
+        approx_state[this_idx] = diff_norm_tensor.item()
+
+    def set_baseline_state(self, this_layer: int, output):
+        self.baseline_state[this_layer] = \
+            output, self.norm_func(output), np.prod(output.shape)
+
+    def injected_approx_forward(
+            self, original_forward: Callable,
+            this_idx: int, changed_idx: int, approx_name: str, x
+    ):
+        if this_idx == 0:
+            baseline_input, _, _ = self.baseline_state[-1]
+            self.set_approx_state(self.approx_state[changed_idx][approx_name], x, -1)
+        output = original_forward(x)
+        self.set_approx_state(self.approx_state[changed_idx][approx_name], output, this_idx)
+        return output
+
+    def injected_baseline_forward(
+            self, original_forward: Callable, layer_idx: int, x
+    ):
+        if layer_idx == 0:
+            self.set_baseline_state(-1, x)
+            self.set_approx_state(self.approx_state[-1][''], x, -1)
+        output = original_forward(x)
+        self.set_baseline_state(layer_idx, output)
+        self.set_approx_state(self.approx_state[-1][''], output, layer_idx)
+        return output
+
+    def make_injected_forward(
+            self, net_w: IndexableNetWrapper,
+            approx_key: Optional[approx_key_t], module: nn.Module
+    ):
+        original_forward = module.forward
+        idx = net_w.get_layer_idx(module)
+        if idx is None:
+            return
+        if approx_key is None:
+            module.forward = partial(
+                self.injected_baseline_forward, original_forward, idx
+            )
+        else:
+            changed_idx, approx_name = approx_key
+            module.forward = partial(
+                self.injected_approx_forward, original_forward, idx,
+                changed_idx, approx_name
+            )
 
     def _inject_network(
             self, net_w: IndexableNetWrapper,
@@ -151,26 +202,7 @@ class SensitivityAnalysis:
     ) -> IndexableNetWrapper:
         if need_copy:
             net_w = IndexableNetWrapper(copy.deepcopy(net_w.net))
-
-        def make_injected_forward(module: nn.Module):
-            original_forward = module.forward
-            idx = net_w.get_layer_idx(module)
-            if idx is None:
-                return
-
-            def injected_forward(x):
-                output = original_forward(x)
-                if not approx_key:
-                    self.baseline_state[idx] = output
-                    return output
-                changed_layer, approx = approx_key
-                if changed_layer == idx:
-                    self.approx_state[idx][approx] = output
-                return output
-
-            module.forward = injected_forward
-
-        net_w.net.apply(lambda m: make_injected_forward(m))
+        net_w.net.apply(lambda m: self.make_injected_forward(net_w, approx_key, m))
         return net_w
 
     def inject_baseline(self, net: nn.Module):
@@ -189,20 +221,33 @@ class SensitivityAnalysis:
                 injected_w = self._inject_network(new_net_w, approx_key, False)
                 yield approx_key, injected_w
 
-    def compute_layerwise_diff(self, norm) -> Dict[int, Dict[str, float]]:
+    def compute_layerwise_diff(self) -> Dict[int, Dict[str, float]]:
         ret = {}
         for layer_id in self.approx_state.keys():
             lhs_st, rhs_sts = self.baseline_state[layer_id], self.approx_state[layer_id]
             ret[layer_id] = {
-                approx: norm(lhs_st - rhs_st) for approx, rhs_st in rhs_sts.items()
+                approx: self.norm_func(lhs_st - rhs_st) for approx, rhs_st in rhs_sts.items()
             }
         return ret
+
+
+def dump_approx_state(sa: SensitivityAnalysis):
+    from collections import defaultdict
+    import pandas as pandas
+    flattened = defaultdict(dict)
+    for k1, v1 in sa.approx_state.items():
+        (k2, v2), = v1.items()
+        for k3, v3 in v2.items():
+            flattened[k1][k3] = v3
+    df = pandas.DataFrame(dict(flattened))
+    with open('output.html', 'w') as f:
+        print(df.T.to_html(), file=f)
 
 
 def main():
     net, testloader, classes, criterion = prelude()
     baseline = net
-    sa = SensitivityAnalysis()
+    sa = SensitivityAnalysis(lambda m: m.norm())
     baseline_w = sa.inject_baseline(baseline)
 
     print("Baseline: ")
@@ -212,7 +257,7 @@ def main():
         print(f"Layer {index}, approximation = {approx_name}")
         test(test_net_w.net, testloader, criterion)
 
-    pprint(sa.compute_layerwise_diff(lambda m: m.norm()))
+    dump_approx_state(sa)
 
 
 if __name__ == "__main__":
