@@ -3,9 +3,9 @@ import copy
 import os
 from collections import defaultdict
 from functools import partial
-from typing import Callable, Dict, Iterable, Optional, Tuple
+from pprint import pprint
+from typing import Callable, Iterable, Optional, Tuple
 
-import numpy as np
 import torch.backends.cudnn as cudnn
 import torchvision
 import torchvision.transforms as transforms
@@ -126,19 +126,22 @@ def prune_weight(ratio: float, layer: nn.Conv2d):
             num_to_zero = int(len(vf) * ratio)
             _, indices = torch.topk(torch.abs(vf), num_to_zero, largest=False, sorted=False)
             vf[indices] = 0.0
-    return f'prune_{ratio}'
 
 
 def get_approxer(net_type: type):
     from functools import partial
     if net_type == nn.Conv2d:
-        return [partial(prune_weight, f) for f in (0.25,)]  # 0.5, 0.7)]
+        return [
+            (partial(prune_weight, f), f'prune_{f}')
+            for f in (0.25, 0.5, 0.7)
+        ]
     else:
         return []
 
 
 class SensitivityAnalysis:
-    approximator_ct = Callable[[nn.Module], str]
+    approximator_ct = Callable[[nn.Module], None]
+    approx_selector_ct = Callable[[type], Iterable[Tuple[approximator_ct, str]]]
     approx_key_t = Tuple[int, str]
 
     def __init__(self, norm):
@@ -146,35 +149,32 @@ class SensitivityAnalysis:
         self.approx_state = defaultdict(lambda: defaultdict(dict))
         self.norm_func = norm
 
-    def set_approx_state(self, approx_state: Dict[float, float], output, this_idx: int):
-        baseline, base_norm, n_elem = self.baseline_state[this_idx]
-        diff_norm_tensor = self.norm_func(output - baseline)  # / base_norm / n_elem
-        approx_state[this_idx] = diff_norm_tensor.item()
+    def set_approx_state(self, changed_idx: int, approx_name: str, this_idx: int, output):
+        baseline, base_norm = self.baseline_state[this_idx]
+        normed_norm = self.norm_func(output - baseline) / base_norm
+        self.approx_state[approx_name][changed_idx][this_idx] = normed_norm
+        if this_idx - 1 >= changed_idx:
+            last_norm = self.approx_state[approx_name][changed_idx][this_idx - 1]
+            if last_norm != 0.0:
+                self.approx_state[f'{approx_name}_coef'][changed_idx][this_idx] = normed_norm / last_norm
 
     def set_baseline_state(self, this_layer: int, output):
-        self.baseline_state[this_layer] = \
-            output.clone().detach(), self.norm_func(output), np.prod(output.shape)
+        self.baseline_state[this_layer] = output.clone().detach(), self.norm_func(output)
 
     def injected_approx_forward(
             self, original_forward: Callable,
             this_idx: int, changed_idx: int, approx_name: str, x
     ):
-        if this_idx == 0:
-            baseline_input, _, _ = self.baseline_state[-1]
-            self.set_approx_state(self.approx_state[changed_idx][approx_name], x, -1)
         output = original_forward(x)
-        self.set_approx_state(self.approx_state[changed_idx][approx_name], output, this_idx)
+        if this_idx >= changed_idx:
+            self.set_approx_state(changed_idx, approx_name, this_idx, output)
         return output
 
     def injected_baseline_forward(
             self, original_forward: Callable, layer_idx: int, x
     ):
-        if layer_idx == 0:
-            self.set_baseline_state(-1, x)
-            self.set_approx_state(self.approx_state[-1][''], x, -1)
         output = original_forward(x)
         self.set_baseline_state(layer_idx, output)
-        self.set_approx_state(self.approx_state[-1][''], output, layer_idx)
         return output
 
     def make_injected_forward(
@@ -209,45 +209,40 @@ class SensitivityAnalysis:
         return self._inject_network(IndexableNetWrapper(net), None, True)
 
     def get_tests_to_run(
-            self, net: nn.Module,
-            layer_approx_fun: Callable[[type], Iterable[approximator_ct]]
+            self, net: nn.Module, layer_approx_fun: approx_selector_ct
     ) -> Iterable[Tuple[approx_key_t, IndexableNetWrapper]]:
         net_w = IndexableNetWrapper(net)
         for index, layer in enumerate(net_w):
-            for approxer in layer_approx_fun(type(layer)):
+            for approxer, approx_name in layer_approx_fun(type(layer)):
                 new_net_w = IndexableNetWrapper(copy.deepcopy(net))
-                approx_name = approxer(new_net_w[index])
+                approxer(new_net_w[index])
                 approx_key = index, approx_name
                 injected_w = self._inject_network(new_net_w, approx_key, False)
                 yield approx_key, injected_w
 
-    def compute_layerwise_diff(self) -> Dict[int, Dict[str, float]]:
-        ret = {}
-        for layer_id in self.approx_state.keys():
-            lhs_st, rhs_sts = self.baseline_state[layer_id], self.approx_state[layer_id]
-            ret[layer_id] = {
-                approx: self.norm_func(lhs_st - rhs_st) for approx, rhs_st in rhs_sts.items()
-            }
-        return ret
 
+def dump_approx_state(net_w: IndexableNetWrapper, sa: SensitivityAnalysis):
+    def get_short_name(idx) -> str:
+        layer_name = str(net_w[idx]).split('(')[0]
+        return f"{idx} ({layer_name})"
 
-def dump_approx_state(sa: SensitivityAnalysis):
-    from collections import defaultdict
-    import pandas as pandas
-    flattened = defaultdict(dict)
-    for k1, v1 in sa.approx_state.items():
-        (k2, v2), = v1.items()
-        for k3, v3 in v2.items():
-            flattened[k1][k3] = v3
-    df = pandas.DataFrame(dict(flattened))
-    with open('output.html', 'w') as f:
-        print(df.T.to_html(), file=f)
+    import pandas
+
+    output_str = ''
+    for approx_name, table_dict in sa.approx_state.items():
+        df = pandas.DataFrame(dict(table_dict))
+        df.index = [get_short_name(c) for c in df.index]
+        output_str += f'{approx_name} <br>\n'
+        output_str += df.to_html()
+        output_str += '\n'
+    with open(f'output.html', 'w') as f:
+        print(output_str, file=f)
 
 
 def main():
     net, testloader, classes, criterion = prelude()
     baseline = net
-    sa = SensitivityAnalysis(lambda m: m.norm())
+    sa = SensitivityAnalysis(lambda m: m.norm().item())
     baseline_w = sa.inject_baseline(baseline)
 
     print("Baseline: ")
@@ -257,7 +252,11 @@ def main():
         print(f"Layer {index}, approximation = {approx_name}")
         test(test_net_w.net, testloader, criterion)
 
-    dump_approx_state(sa)
+    with open('struct.txt', 'w') as f:
+        pprint(baseline, stream=f)
+        pprint(baseline_w.basic_layers, stream=f)
+        pprint({k: (v[1], v[0].shape) for k, v in sa.baseline_state.items()}, stream=f)
+    dump_approx_state(baseline_w, sa)
 
 
 if __name__ == "__main__":
