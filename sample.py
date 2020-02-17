@@ -153,7 +153,7 @@ class SensitivityAnalysis:
 
     def set_baseline_state(self, this_layer: int, output):
         self.baseline_state[this_layer] = \
-            output, self.norm_func(output), np.prod(output.shape)
+            output.clone().detach(), self.norm_func(output), np.prod(output.shape)
 
     def injected_approx_forward(
             self, original_forward: Callable,
