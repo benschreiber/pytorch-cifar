@@ -1,59 +1,63 @@
-'''Test kernel filtering techniques on a pretrained CIFAR10 model.'''
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-import torch.backends.cudnn as cudnn
+"""Test kernel filtering techniques on a pretrained CIFAR10 model."""
+import copy
+import os
 
+import torch.backends.cudnn as cudnn
 import torchvision
 import torchvision.transforms as transforms
 
-import os
-import argparse
-
 from models import *
 from utils import progress_bar
-from timeit import default_timer as timer
-import copy
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-print('==> Preparing data..')
-transform_test = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-])
 
-testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
-testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=2)
+def prelude():
+    print('==> Preparing data..')
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2023, 0.1994, 0.2010)),
+    ])
 
-classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+    testset = torchvision.datasets.CIFAR10(
+        root='./data', train=False, download=True, transform=transform_test)
+    testloader = torch.utils.data.DataLoader(
+        testset, batch_size=100, shuffle=False, num_workers=2)
 
-print('==> Building model..')
-net = ResNet18()
-net = net.to(device)
-if device == 'cuda':
-    net = torch.nn.DataParallel(net)
-    cudnn.benchmark = True
-criterion = nn.CrossEntropyLoss()
+    classes = ('plane', 'car', 'bird', 'cat', 'deer',
+               'dog', 'frog', 'horse', 'ship', 'truck')
 
-print('==> Loading checkpoint..')
-assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
-if device == 'cpu':
-    # Trained on GPU with DataParallel, so some changes needed to load on CPU
-    pyt_device = torch.device('cpu')
-    checkpoint = torch.load('./checkpoint/ckpt.pth', map_location=pyt_device)
-    from collections import OrderedDict
-    new_state_dict = OrderedDict()
-    for k, v in checkpoint['net'].items():
-        name = k[7:] # remove `module.`
-        new_state_dict[name] = v
-    net.load_state_dict(new_state_dict)
-else:
-    checkpoint = torch.load('./checkpoint/ckpt.pth')
-    net.load_state_dict(checkpoint['net'])
+    print('==> Building model..')
+    net = ResNet18()
+    net = net.to(device)
+    if device == 'cuda':
+        net = torch.nn.DataParallel(net)
+        cudnn.benchmark = True
+    criterion = nn.CrossEntropyLoss()
 
-def test(net):
+    print('==> Loading checkpoint..')
+    assert os.path.isdir(
+        'checkpoint_saved'), 'Error: no checkpoint directory found!'
+    if device == 'cpu':
+        # Trained on GPU with DataParallel, so some changes needed to load on CPU
+        pyt_device = torch.device('cpu')
+        checkpoint = torch.load(
+            './checkpoint_saved/ckpt.pth', map_location=pyt_device)
+        from collections import OrderedDict
+        new_state_dict = OrderedDict()
+        for k, v in checkpoint['net'].items():
+            name = k[7:]  # remove `module.`
+            new_state_dict[name] = v
+        net.load_state_dict(new_state_dict)
+    else:
+        checkpoint = torch.load('./checkpoint_saved/ckpt.pth')
+        net.load_state_dict(checkpoint['net'])
+
+    return net, testloader, classes, criterion
+
+
+def test(net, testloader, criterion):
     net.eval()
     test_loss = 0
     correct = 0
@@ -70,47 +74,36 @@ def test(net):
             correct += predicted.eq(targets).sum().item()
 
             progress_bar(batch_idx, len(testloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
+                         % (test_loss / (batch_idx + 1), 100. * correct / total, correct, total))
 
-    acc = 100.*correct/total
+    acc = 100. * correct / total
     return acc
 
-baseline = net
 
-print('BASELINE')
-test(baseline)
-
-kernel_labels = [k for k in net.state_dict().keys() if 'conv' in k and 'weight' in k]
-#print(net.state_dict()[kernel_labels[0]])
-start = timer()
-for stride in (3,):
-    net = copy.deepcopy(baseline) 
-    for k in kernel_labels:
-        print(net.state_dict()[k].size())
+def make_filtered_net(baseline, skip_ratio):
+    net = copy.deepcopy(baseline)
+    for k, v in baseline.state_dict().items():
+        if 'conv' not in k or 'weight' not in k:
+            continue
         with torch.no_grad():
-            '''
-            # Strided
-            # todo compute stride
-            net.state_dict()[k].flatten()[::stride][:] = 0.
-            '''
-            # Smallest
-            num_to_zero = int(len(net.state_dict()[k].flatten()) * 0.5)
-            _, indices = torch.topk(torch.abs(net.state_dict()[k].flatten()), num_to_zero, largest=False, sorted=False)
+            # Set smallest weights to zero
+            vf = v.flatten()
+            num_to_zero = int(len(vf) * skip_ratio)
+            _, indices = torch.topk(torch.abs(vf), num_to_zero, largest=False, sorted=False)
             net.state_dict()[k].flatten()[indices] = 0.0
-end = timer()
-#print(net.state_dict()[kernel_labels[0]])
+    return net
 
-print('FILTERED')
-test(net)
 
-test(baseline)
+def main():
+    net, testloader, classes, criterion = prelude()
+    baseline = net
+    print('Baseline: ')
+    test(baseline, testloader, criterion)
+    for ratio in (0.25, 0.5, 0.7):
+        print(f"Filter(ratio={ratio}): ")
+        filtered = make_filtered_net(baseline, ratio)
+        test(filtered, testloader, criterion)
 
-'''
-for stride in (4,):
-    scale_factor = stride / (stride - 1.)
-    for k in kernel_labels:
-        net.state_dict()[k] *= scale_factor
 
-print('RESCALED')
-test(net)
-'''
+if __name__ == "__main__":
+    main()
