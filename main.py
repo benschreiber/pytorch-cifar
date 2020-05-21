@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
+import torch.nn.utils.prune as prune
 
 import torchvision
 import torchvision.transforms as transforms
@@ -54,8 +55,8 @@ classes = ('plane', 'car', 'bird', 'cat', 'deer',
 
 # Model
 print('==> Building model..')
-# net = VGG('VGG19')
-# net = ResNet18()
+#net = VGG('VGG16')
+net = ResNet18()
 # net = PreActResNet18()
 # net = GoogLeNet()
 # net = DenseNet121()
@@ -67,7 +68,7 @@ print('==> Building model..')
 # net = SENet18()
 # net = ShuffleNetV2(1)
 # net = EfficientNetB0()
-net = RegNetX_200MF()
+# net = RegNetX_200MF()
 net = net.to(device)
 if device == 'cuda':
     net = torch.nn.DataParallel(net)
@@ -83,14 +84,12 @@ if args.resume:
     start_epoch = checkpoint['epoch']
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(net.parameters(), lr=args.lr,
-                      momentum=0.9, weight_decay=5e-4)
 
 # Training
 
-
-def train(epoch):
-    print('\nEpoch: %d' % epoch)
+def train(epoch, optimizer, prune_rate, baseline_acc, best_acc):
+    #print('\nEpoch: %d\tPruning Rate: %.2f%%' % (epoch, prune_rate*100))
+    print(f'\nEpoch: {epoch}\tPruning Rate: {prune_rate*100:.2f}%\tBaseline Accuracy: {baseline_acc:.2f}%\tBest Accuracy: {best_acc:.2f}%')
     net.train()
     train_loss = 0
     correct = 0
@@ -112,13 +111,13 @@ def train(epoch):
                      % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
 
-def test(epoch):
+def test(epoch, i=None):
     global best_acc
     net.eval()
     test_loss = 0
     correct = 0
     total = 0
-    with torch.no_grad():
+    with torch.no_grad(): 
         for batch_idx, (inputs, targets) in enumerate(testloader):
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = net(inputs)
@@ -146,7 +145,48 @@ def test(epoch):
         torch.save(state, './checkpoint/ckpt.pth')
         best_acc = acc
 
+        if i is not None:
+            if not os.path.isdir('pruned_models'):
+                os.mkdir('pruned_models')
+            torch.save(net, f'./pruned_models/pruned_model_{i}.pth')
+    return acc
 
-for epoch in range(start_epoch, start_epoch+200):
-    train(epoch)
+
+prune_rate = 0.0
+prune_gamma = 0.2
+parameters_to_prune = [(module, 'weight') for module in net.modules() if isinstance(module, nn.Conv2d)]
+results = []
+baseline_acc = 0.0
+
+for i in range(20):
+    optimizer = optim.SGD(net.parameters(), lr=args.lr,
+                          momentum=0.9, weight_decay=5e-4) #orig 5e-4, 4e-5
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+
+    for epoch in range(start_epoch, start_epoch+90):
+        train(epoch, optimizer, prune_rate, baseline_acc, best_acc)
+        test(epoch, i)
+        scheduler.step()
+
+    if i == 0:
+        baseline_acc = best_acc
+
+    print(f'recovered accuracy {best_acc:.2f}% from baseline {baseline_acc:.2f}% at pruning rate {100*prune_rate:.2f}%, a change of {best_acc-baseline_acc:.2f}%')
+    results.append((i, best_acc, prune_rate))
+
+    prune_rate += prune_gamma * (1 - prune_rate)
+    print(f'new pruning rate: {prune_rate*100:.2f}%')
+    prune.global_unstructured(
+            parameters_to_prune,
+            pruning_method=prune.L1Unstructured,
+            amount=prune_gamma
+    )
+    print('post pruning:')
     test(epoch)
+    best_acc = 0
+
+    print()
+    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~ RESULTS ~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
+    print('#\tPruning Rate\tAccuracy')
+    for _i, _acc, _prune_rate in results:
+        print(f'{_i}\t{_prune_rate*100:.2f}%\t\t{_acc:.2f}%')
